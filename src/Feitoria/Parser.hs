@@ -58,12 +58,13 @@ data LazyTableRun = NullRun {
                     }
 
 putTable :: LazyTable -> FilePath -> IO ()
-putTable table fp = putLazyTable table
+putTable table fp = undefined
 
 putLazyTable :: LazyTable -> LazyTableWriter
 putLazyTable (LazyTable header cols) = do
     lift (putTableHeader header)
-    mapM_ (putColumnHeader . lazyHeader) cols
+    -- write all of the headers, and then write all of the cells
+    mapM_ (lift . putColumnHeader . lazyHeader) cols
     mapM_ (putCells . lazyCells) cols
 
 putTableHeader :: TableHeader -> Put
