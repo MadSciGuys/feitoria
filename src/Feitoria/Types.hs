@@ -30,7 +30,7 @@ data LazyTable = LazyTable {
 
 data MMapTable = MMapTable {
     mmapTblHeader          :: !TableHeader
-  , mmapTblPtr             :: !Ptr ()
+  , mmapTblPtr             :: !(Ptr ())
   , mmapTblStringLitOffset :: !Int
   , mmapTblArrayLitOffset  :: !Int
   , mmapTblBinaryLitOffset :: !Int
@@ -40,35 +40,36 @@ data MMapTable = MMapTable {
 data ColumnHeader = ColumnHeader {
     colName       :: !T.Text
   , colType       :: !CellType
+  , colStart      :: !Word64
   , colArrayDepth :: !Word64
-  , colMimeGuess  :: Maybe MIMEType
+  , colMIMEType   :: !MIMEType
   } deriving (Eq, Ord, Show)
 
 data LazyColumn = LazyColumn {
     lazyHeader :: !ColumnHeader
   , lazyCells  :: [Maybe Cell]
-  }
+  } deriving (Eq, Ord, Show)
 
 data MMapColumn = MMapColumn {
     mmapHeader :: !ColumnHeader
   , mmapOffset :: !Int
-  }
+  } deriving (Eq, Ord, Show)
 
-data CellType = UInt
-              | Int
-              | Double
-              | DateTime
-              | String
-              | Binary
-              | Boolean
+data CellType = TypeUInt
+              | TypeInt
+              | TypeDouble
+              | TypeDateTime
+              | TypeString
+              | TypeBinary
+              | TypeBoolean
               deriving (Eq, Ord, Show)
 
-data Cell = UInt !Word64
-          | Int !Int
-          | Double !Double
-          | DateTime !UTCTime
-          | String !T.Text
-          | Binary !B.ByteString
-          | Boolean !Bool
-          | Array !(V.Vector Cell)
+data Cell = CellUInt !Word64
+          | CellInt !Int
+          | CellDouble !Double
+          | CellDateTime !UTCTime
+          | CellString !T.Text
+          | CellBinary !B.ByteString
+          | CellBoolean !Bool
+          | CellArray !(V.Vector Cell)
           deriving (Eq, Ord, Show)
