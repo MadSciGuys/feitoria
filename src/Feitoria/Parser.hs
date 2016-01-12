@@ -58,12 +58,13 @@ data LazyTableRun = NullRun {
                     }
 
 putTable :: LazyTable -> FilePath -> IO ()
-putTable = undefined
+putTable table fp = putLazyTable table
 
 putLazyTable :: LazyTable -> LazyTableWriter
 putLazyTable (LazyTable header cols) = do
     lift (putTableHeader header)
-    mapM_ putLazyColumn cols
+    mapM_ (putColumnHeader . lazyHeader) cols
+    mapM_ (putCells . lazyCells) cols
 
 putTableHeader :: TableHeader -> Put
 putTableHeader t = do
@@ -72,11 +73,6 @@ putTableHeader t = do
     putStrictByteString (T.encodeUtf8 (tblTitle t))
     putWord64le (tblNumColumns t)
     putWord64le (tblNumRecords t)
-
-putLazyColumn :: LazyColumn -> LazyTableWriter
-putLazyColumn (LazyColumn header cells) = do
-    lift (putColumnHeader header)
-    putCells cells
 
 putColumnHeader :: ColumnHeader -> Put
 putColumnHeader c = do
