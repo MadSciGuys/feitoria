@@ -19,8 +19,6 @@ import qualified Data.Vector as V
 data TableHeader = TableHeader {
     tblProtVersion :: !Word64
   , tblTitle       :: !T.Text
-  , tblNumColumns  :: !Word64
-  , tblNumRecords  :: !Word64
   } deriving (Eq, Ord, Show)
 
 data LazyTable = LazyTable {
@@ -31,18 +29,19 @@ data LazyTable = LazyTable {
 data MMapTable = MMapTable {
     mmapTblHeader          :: !TableHeader
   , mmapTblPtr             :: !(Ptr ())
+  , mmapTblCols            :: [MMapColumn]
+  , mmapTblNumColumns      :: !Word64
+  , mmapTblNumRecords      :: !Word64
+  , mmapTblColTblOffset    :: !Int
   , mmapTblStringLitOffset :: !Int
   , mmapTblArrayLitOffset  :: !Int
   , mmapTblBinaryLitOffset :: !Int
-  , mmapTblCols            :: [MMapColumn]
   } deriving (Eq, Ord, Show)
 
 data ColumnHeader = ColumnHeader {
     colName       :: !T.Text
   , colType       :: !CellType
-  , colStart      :: !Word64
   , colArrayDepth :: !Word64
-  , colMIMEType   :: !MIMEType
   } deriving (Eq, Ord, Show)
 
 data LazyColumn = LazyColumn {
@@ -60,7 +59,7 @@ data CellType = TypeUInt
               | TypeDouble
               | TypeDateTime
               | TypeString
-              | TypeBinary
+              | TypeBinary !MIMEType
               | TypeBoolean
               deriving (Eq, Ord, Show)
 
