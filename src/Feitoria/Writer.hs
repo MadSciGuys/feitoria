@@ -2,31 +2,42 @@
            , BangPatterns
            #-}
 
-module Feitoria.Parser where
+module Feitoria.Writer where
 
-import Data.ByteString.Lazy as B
+import qualified Data.ByteString.Lazy as BL
+
+import Control.Exception
 
 import Codec.MIME.Type
 import Codec.MIME.Parse
 
+import Control.Monad
+import Control.Monad.IO.Class
 import Control.Monad.Trans.Class
 import Control.Monad.Trans.State
 
 import Data.Binary.Get
 import Data.Binary.Put
 
-import Data.Map as M
+import Data.Bits
+
+import Data.Bool
+
+import qualified Data.Map as M
+
+import Data.Maybe
 
 import qualified Data.ByteString as B
 
 import Data.Time
+import Data.Time.Clock.POSIX
 
 import Data.Word
 
 import Foreign.Ptr
 import Foreign.Storable
-import Foreign.Marshall.Alloc
-import Foreign.Marshall.Unsafe (unsafeLocalState)
+import Foreign.Marshal.Alloc
+import Foreign.Marshal.Unsafe (unsafeLocalState)
 
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
@@ -36,6 +47,9 @@ import qualified Data.Vector as V
 import Feitoria.Types
 
 import System.Directory
+
+import System.IO
+
 import System.IO.Temp
 
 type LazyTableWriter = StateT LazyTableState IO ()
@@ -43,9 +57,9 @@ type LazyTableWriter = StateT LazyTableState IO ()
 type DiffList a = [a] -> [a]
 
 data LazyTableState = LazyTableState {
-    stringLitCache :: M.Map T.Text Int
-  , arrayLitCache  :: M.Map (V.Vector Cell) Int
-  , binaryLitCache :: M.Map B.ByteString Int
+    stringLitCache :: M.Map T.Text Word64
+  , arrayLitCache  :: M.Map (V.Vector Cell) Word64
+  , binaryLitCache :: M.Map B.ByteString Word64
   , currentRun     :: !LazyTableRun
   , currentColLen  :: !Word64
   , validColLen    :: !(Maybe Word64)
@@ -59,18 +73,18 @@ data LazyTableState = LazyTableState {
   }
 
 data LazyTableRun = NullRun {
-                      nullRunLen :: !Int
-                    , nullRunRow :: !Int
+                      nullRunLen :: !Word64
+                    , nullRunRow :: !Word64
                     }
                   | UniqueRun {
-                      uniqueRunLen  :: !Int
-                    , uniqueRunRow  :: !Int
+                      uniqueRunLen  :: !Word64
+                    , uniqueRunRow  :: !Word64
                     , uniqueRunVals :: DiffList Cell
                     , uniqueRunLast :: !Cell
                     }
                   | ValueRun {
-                      valueRunLen :: !Int
-                    , valueRunRow :: !Int
+                      valueRunLen :: !Word64
+                    , valueRunRow :: !Word64
                     , valueRunVal :: !Cell
                     }
                   | UninitializedRun
@@ -109,25 +123,25 @@ closeTempFP (f, h) = hClose h >> removeFile f
 --   of cell offsets.
 putTable' :: LazyTable -> FilePath -> LazyTableWriter
 putTable' t o = do
-    outfile     <- openFile o WriteMode
-    putHandle outfile $ putTableHeader (lazyTblHeader o)
+    outfile     <- liftIO $ openFile o WriteMode
+    liftIO $ putHandle outfile $ putTableHeader (lazyTblHeader t)
     mapM_ (putColumnCells . lazyCells) (lazyTblCols t)
     offsets     <- ($ []) <$> gets columnOffsets
     let colheaders = zipWith MMapColumn (map lazyHeader (lazyTblCols t)) offsets
-    mapM_ putColumnHeader colheaders
+    mapM_ (putInStateFP colHeaderFP . putColumnHeader) colheaders
     -- get all the temporary files
-    (chfp, chh) <- gets colHeaderFP
-    (ctfp, cth) <- gets columnFP
-    (stfp, sth) <- gets stringLitFP
-    (atfp, ath) <- gets arrayLitFP
-    (btfp, bth) <- gets binaryLitFP
+    ch@(chfp, chh) <- gets colHeaderFP
+    ct@(ctfp, cth) <- gets columnFP
+    st@(stfp, sth) <- gets stringLitFP
+    at@(atfp, ath) <- gets arrayLitFP
+    bt@(btfp, bth) <- gets binaryLitFP
     -- get the size of all of the temporary files
-    th_len      <- fromIntegral <$> hTell outfile
-    ch_len      <- fromIntegral <$> hTell chh
-    ct_len      <- fromIntegral <$> hTell cth
-    st_len      <- fromIntegral <$> hTell sth
-    at_len      <- fromIntegral <$> hTell ath
-    bt_len      <- fromIntegral <$> hTell bth
+    th_len      <- liftIO $ fromIntegral <$> hTell outfile
+    ch_len      <- liftIO $ fromIntegral <$> hTell chh
+    ct_len      <- liftIO $ fromIntegral <$> hTell cth
+    st_len      <- liftIO $ fromIntegral <$> hTell sth
+    at_len      <- liftIO $ fromIntegral <$> hTell ath
+    bt_len      <- liftIO $ fromIntegral <$> hTell bth
     col_count   <- gets colCount
     rec_count   <- fromMaybe 0 <$> gets validColLen
     -- get the offsets for the various tables
@@ -144,21 +158,21 @@ putTable' t o = do
                 putHandle outfile $ putWord64le at_offset
                 putHandle outfile $ putWord64le bt_offset
                 catHandles outfile chh
-                closeTempFP chh
+                closeTempFP ch
                 catHandles outfile cth
-                closeTempFP cth
+                closeTempFP ct
                 catHandles outfile sth
-                closeTempFP sth
+                closeTempFP st
                 catHandles outfile ath
-                closeTempFP ath
+                closeTempFP at
                 catHandles outfile bth
-                closeTempFP bth
+                closeTempFP bt
                 hClose outfile
 
 -- | Run a 'Put' and write the output to a 'Handle' in one go. Assumes the 'Put'
 --   is terminal.
 putHandle :: Handle -> Put -> IO ()
-putHandle h p = runPut p >>= B.hPut h
+putHandle h = BL.hPut h . runPut
 
 -- | Assumes the source handle is finite. Please make this exception safe.
 catHandles :: Handle -> Handle -> IO ()
@@ -168,11 +182,11 @@ putTableHeader :: TableHeader -> Put
 putTableHeader t = do
     putByteString "w\01\01\01"
     putWord64le (tblProtVersion t)
-    putStrictByteString (T.encodeUtf8 (tblTitle t))
+    putTextUtf8 (tblTitle t)
 
 putColumnHeader :: MMapColumn -> Put
 putColumnHeader (MMapColumn c o) = do
-    putStrictByteString (T.encodeUtf8 (colName c))
+    putTextUtf8 (colName c)
     putCellType (colType c)
     putWord64le (colArrayDepth c)
     putWord64le (fromIntegral o)
@@ -181,7 +195,7 @@ putColumnHeader (MMapColumn c o) = do
 putColumnCells :: [Maybe Cell] -> LazyTableWriter
 putColumnCells [] = finalizeCol
 putColumnCells cs = do
-    offset <- fromIntegral <$> (gets (snd . columnFP) >>= liftIO hTell)
+    offset <- fromIntegral <$> (gets (snd . columnFP) >>= liftIO . hTell)
     modify' (\s -> s { columnOffsets = (columnOffsets s) . (offset:) })
     mapM_ runFrames cs
     finalizeCol
@@ -215,13 +229,13 @@ firstRun :: Maybe Cell -> LazyTableWriter
 firstRun Nothing  = modify' (\s -> s { currentRun = NullRun 1 0 })
 firstRun (Just c) = modify' (\s -> s { currentRun = ValueRun 1 0 c})
 
-runNulls :: Maybe Cell -> Int -> Int -> LazyTableWriter
+runNulls :: Maybe Cell -> Word64 -> Word64 -> LazyTableWriter
 runNulls Nothing l r  = modify'
     (\s -> s { currentRun = (currentRun s) { nullRunLen = (l + 1) }})
 runNulls (Just c) l r = putFrame >> modify'
     (\s -> s { currentRun = ValueRun 1 (r + l) c })
 
-runUniques :: Maybe Cell -> Int -> Int -> DiffList Cell -> Cell -> LazyTableWriter
+runUniques :: Maybe Cell -> Word64 -> Word64 -> DiffList Cell -> Cell -> LazyTableWriter
 runUniques Nothing l r _ _ = putFrame >> modify'
     (\s -> s { currentRun = NullRun 1 (r + l) })
 runUniques (Just c) l r vs v
@@ -250,7 +264,7 @@ runUniques (Just c) l r vs v
           }
         )
 
-runValues :: Maybe Cell -> Int -> Int -> Cell -> LazyTableWriter
+runValues :: Maybe Cell -> Word64 -> Word64 -> Cell -> LazyTableWriter
 runValues Nothing l r _ = putFrame >> modify'
     (\s -> s { currentRun = NullRun 1 (r + l)})
 runValues (Just c) l r v
@@ -265,19 +279,92 @@ runValues (Just c) l r v
         (\s -> s { currentRun = ValueRun 1 (r + l) c })
 
 putFrame :: LazyTableWriter
-putFrame = undefined
+putFrame = do
+    run <- gets currentRun
+    case run of
+        NullRun l r        -> do
+            putInStateFP columnFP $ putWord16le 0
+            putInStateFP columnFP $ putWord64le r
+            putInStateFP columnFP $ putWord64le l
+        UniqueRun l r vs v -> do
+            putInStateFP columnFP $ putWord16le $ fromIntegral l .|. shift 0x02 14
+            putInStateFP columnFP $ putWord64le r
+            putCell (CellArray (V.fromList $ vs []))
+        ValueRun l r v     -> do
+            putInStateFP columnFP $ putWord16le $ fromIntegral l .|. shift 0x03 14
+            putInStateFP columnFP $ putWord64le r
+            putCell v
+        UninitializedRun   -> error "Uninitialized run"
 
+-- | Write a cell to the current column and literal tables if necessary.
 putCell :: Cell -> LazyTableWriter
-putCell (CellUInt i)     = lift $ gets putHandle (putWord64le i)
-putCell (CellInt i)      = lift $ putWord64le (fromIntegral i)
-putCell (CellDouble d)   = lift $ unsafePutIEEEDouble d
-putCell (CellDateTime t) = lift $ putWord64le $ fromIntegral $ utcTimeToPOSIXSeconds t
-putCell (CellString t)   = 
-putCell (CellBinary b)   =
-putCell (CellBoolean b)  =
-putCell (CellArray a)    =
+putCell c = do
+    storeCell c
+    s <- get
+    putInStateFP columnFP $ putCellValue s c
+    where
+        -- | Put inline cell value.
+        putCellValue :: LazyTableState -> Cell -> Put
+        putCellValue s (CellUInt i)     = putWord64le i
+        putCellValue s (CellInt i)      = putWord64le $ fromIntegral i
+        putCellValue s (CellDouble d)   = unsafePutIEEEDouble d
+        putCellValue s (CellDateTime t) =
+            putWord64le $ fromInteger $ floor $ utcTimeToPOSIXSeconds t
+        putCellValue s (CellString t)   =
+            -- it's valid to use fromJust because the storeCell call will always
+            -- insert this value into the map
+            putWord64le $ fromJust $ M.lookup t $ stringLitCache s
+        putCellValue s (CellBinary b)   =
+            putWord64le $ fromJust $ M.lookup b $ binaryLitCache s
+        putCellValue s (CellArray a)    =
+            putWord64le $ fromJust $ M.lookup a $ arrayLitCache s
 
-putInColumnFP :: Put -> LazyTableWriter
+        -- | Write cell to associated literal table file and literal cache.
+        storeCell :: Cell -> LazyTableWriter
+        storeCell (CellUInt i)     = return ()
+        storeCell (CellInt i)      = return ()
+        storeCell (CellDouble d)   = return ()
+        storeCell (CellDateTime t) = return ()
+        storeCell (CellString t)   =
+            storeVarCell
+                t
+                stringLitFP
+                stringLitCache
+                (\s a -> s { stringLitCache = a })
+                (putTextUtf8 t)
+        storeCell (CellBinary b)   =
+            storeVarCell
+                b
+                binaryLitFP
+                binaryLitCache
+                (\s a -> s { binaryLitCache = a })
+                (putSizedByteString b)
+        storeCell (CellArray a)    = do
+            V.mapM_ storeCell a
+            s <- get
+            storeVarCell
+                a
+                arrayLitFP
+                arrayLitCache
+                (\s a -> s { arrayLitCache = a })
+                (putWord64le (fromIntegral $ V.length a) >> V.mapM_ (putCellValue s) a)
+
+        storeVarCell :: (Ord k) => k
+                     -> (LazyTableState -> (FilePath, Handle))
+                     -> (LazyTableState -> M.Map k Word64)
+                     -> (LazyTableState -> M.Map k Word64 -> LazyTableState)
+                     -> Put
+                     -> LazyTableWriter
+        storeVarCell k fp getCache setCache p = do
+            cache <- gets getCache
+            offset <- gets fp >>= fmap fromIntegral . liftIO . hTell . snd
+            modify' $ flip setCache (M.insert k offset cache)
+            putInStateFP fp p
+
+putInStateFP :: (LazyTableState -> (FilePath, Handle)) -> Put -> LazyTableWriter
+putInStateFP accessor p = do
+    (_, h) <- gets accessor
+    liftIO $ putHandle h p
 
 putCellType :: CellType -> Put
 putCellType TypeUInt          = putWord8 0
@@ -286,11 +373,19 @@ putCellType TypeDouble        = putWord8 2
 putCellType TypeDateTime      = putWord8 3
 putCellType TypeString        = putWord8 4
 putCellType (TypeBinary mime) = putWord8 5
-    >> putStrictByteString (T.encodeUtf8 ((showMIMEType mime))
+    >> putTextUtf8 (showMIMEType mime)
 putCellType TypeBoolean       = putWord8 6
 
-putStrictByteString :: B.ByteString -> Put
-putStrictByteString = (putWord8 0 <*) . putByteString
+putNullByteString :: B.ByteString -> Put
+putNullByteString = (putWord8 0 <*) . putByteString
+
+putTextUtf8 :: T.Text -> Put
+putTextUtf8 = putNullByteString . T.encodeUtf8
+
+putSizedByteString :: B.ByteString -> Put
+putSizedByteString b = do
+    putWord64le $ fromIntegral $ B.length b
+    putByteString b
 
 -- | This function uses memory allocation that comes back in the IO monad
 -- but since it is only doing memory allocation, we can use unsafeLocalState
