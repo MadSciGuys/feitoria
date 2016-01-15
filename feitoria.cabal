@@ -19,7 +19,7 @@ cabal-version:       >=1.10
 library
   exposed-modules:     Feitoria
   other-modules:       Feitoria.Types
-                       Feitoria.Parser
+                       Feitoria.Writer
   -- other-extensions:    
   build-depends:       base
                      , binary

@@ -61,6 +61,7 @@ data CellType = TypeUInt
               | TypeString
               | TypeBinary !MIMEType
               | TypeBoolean
+              | TypeArray CellType
               deriving (Eq, Ord, Show)
 
 data Cell = CellUInt !Word64
