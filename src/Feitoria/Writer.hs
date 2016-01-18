@@ -377,7 +377,7 @@ putCellType (TypeBinary mime) = putWord8 5
 putCellType TypeBoolean       = putWord8 6
 
 putNullByteString :: B.ByteString -> Put
-putNullByteString = (putWord8 0 <*) . putByteString
+putNullByteString = (*> putWord8 0) . putByteString
 
 putTextUtf8 :: T.Text -> Put
 putTextUtf8 = putNullByteString . T.encodeUtf8
