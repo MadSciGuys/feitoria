@@ -136,17 +136,22 @@ putTable' t o = do
     at@(atfp, ath) <- gets arrayLitFP
     bt@(btfp, bth) <- gets binaryLitFP
     -- get the size of all of the temporary files
-    th_len      <- liftIO $ fromIntegral <$> hTell outfile
-    ch_len      <- liftIO $ fromIntegral <$> hTell chh
-    ct_len      <- liftIO $ fromIntegral <$> hTell cth
-    st_len      <- liftIO $ fromIntegral <$> hTell sth
-    at_len      <- liftIO $ fromIntegral <$> hTell ath
-    bt_len      <- liftIO $ fromIntegral <$> hTell bth
+    th_len <- liftIO $ fromIntegral <$> hTell outfile
+    ch_len <- liftIO $ fromIntegral <$> hTell chh
+    ct_len <- liftIO $ fromIntegral <$> hTell cth
+    st_len <- liftIO $ fromIntegral <$> hTell sth
+    at_len <- liftIO $ fromIntegral <$> hTell ath
+    bt_len <- liftIO $ fromIntegral <$> hTell bth
+    liftIO $ do hSeek chh AbsoluteSeek 0
+                hSeek cth AbsoluteSeek 0
+                hSeek sth AbsoluteSeek 0
+                hSeek ath AbsoluteSeek 0
+                hSeek bth AbsoluteSeek 0
     col_count   <- gets colCount
     rec_count   <- fromMaybe 0 <$> gets validColLen
     -- get the offsets for the various tables
-    let -- 4 offset uint64s + 2 col/row count uint64s + 4 magic bytes = 52
-        ct_offset = th_len + ch_len + 52
+    let -- 4 offset uint64s + 2 col/row count uint64s = 48
+        ct_offset = th_len + ch_len + 48
         st_offset = ct_offset + ct_len
         at_offset = st_offset + st_len
         bt_offset = at_offset + at_len
@@ -198,6 +203,7 @@ putColumnCells cs = do
     offset <- fromIntegral <$> (gets (snd . columnFP) >>= liftIO . hTell)
     modify' (\s -> s { columnOffsets = (columnOffsets s) . (offset:) })
     mapM_ runFrames cs
+    putFrame
     finalizeCol
 
 -- | Get ready to write the next column. Find a better way to throw an error in
