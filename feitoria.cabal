@@ -18,18 +18,15 @@ cabal-version:       >=1.10
 
 library
   exposed-modules:     Feitoria
-                     , Feitoria.Reader
-                     , Feitoria.Types
                      , Feitoria.Writer
   -- other-extensions:    
   build-depends:       base
-                     , binary
                      , bytestring
                      , containers
                      , mime
                      , text
                      , time
-                     , transformers
+                     , mtl
                      , vector
                      , directory
                      , temporary
