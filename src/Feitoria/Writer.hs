@@ -5,12 +5,9 @@
 
 module Feitoria.Writer where
 
-import Codec.MIME.Type
+import           Codec.MIME.Type
 
-import Control.Monad.Trans
-
-import qualified Data.ByteString    as B
-import           Data.ByteString.Builder
+import           Control.Monad.Trans
 
 import           Data.Monoid
 
@@ -19,6 +16,8 @@ import qualified Data.Text.Encoding as T
 
 import           Data.Word
 
+import           Feitoria.DList
+import           Feitoria.IndexedBuilder
 import           Feitoria.Types
 
 import           System.IO
@@ -41,47 +40,14 @@ data ColumnWriter = ColumnWriter {
   , cwCells      :: [Cell]
   }
 
-type DList a = [a] -> [a]
-
-instance Show a => Show ([a] -> [a]) where
-    show = show . ($ [])
-
-dToList :: DList a -> [a]
-dToList = ($ [])
-
-dcons :: a -> DList a -> DList a
-dcons x d = (x:) . d
-
-dsnoc :: DList a -> a -> DList a
-dsnoc d x = d . (x:)
-
-dtail :: DList a -> DList a
-dtail d = tail . d
-
-dinit :: DList a -> DList a
-dinit d = init . d
-
-renderCellType :: CellType -> Builder
+renderCellType :: CellType -> IndexedBuilder
 renderCellType CellTypeUInt       = word8 0
 renderCellType CellTypeInt        = word8 1
 renderCellType CellTypeDouble     = word8 2
 renderCellType CellTypeDateTime   = word8 3
 renderCellType CellTypeString     = word8 4
-renderCellType (CellTypeBinary m) = word8 5 <> renderTextUtf8 (showMIMEType m)
+renderCellType (CellTypeBinary m) = word8 5 <> textUtf8 (showMIMEType m)
 renderCellType CellTypeBoolean    = word8 6
-
-renderByteStringCString :: B.ByteString -> Builder
-renderByteStringCString b = byteString b <> word8 0
-
-renderByteStringPascal :: B.ByteString -> Builder
-renderByteStringPascal b = word64LE (fromIntegral (B.length b))
-                        <> byteString b
-
-renderTextUtf8 :: T.Text -> Builder
-renderTextUtf8 = renderByteStringCString . T.encodeUtf8
-
-hPutBuilderM :: MonadIO m => Handle -> Builder -> m ()
-hPutBuilderM = (liftIO .) . hPutBuilder
 
 data Run = NullRun {
              nullRunLen :: !Word64
@@ -111,14 +77,16 @@ findRuns !n u@(NullRun l r) (Nothing : cs)        = findRuns (n+1) (NullRun (l+1
 findRuns !n u@(NullRun l r) ((Just c) : cs)       = u : findRuns (n+1) (ValueRun 1 (n+1) c) cs
 findRuns !n u@(UniqueRun l r ds d) (Nothing :cs)  = u : findRuns (n+1) (NullRun 1 (n+1)) cs
 findRuns !n u@(UniqueRun l r ds d) ((Just c) :cs)
-    | d == c && l == 2 = (ValueRun 1 r (head (dToList ds))) : findRuns (n+1) (ValueRun 2 n c) cs
-    | d == c           = (UniqueRun (l-1) r (dinit ds) d) : findRuns (n+1) (ValueRun 2 n c) cs
-    | otherwise        = findRuns (n+1) (UniqueRun (l+1) r (dsnoc ds c) c) cs
+    | d == c && l == 2 = (ValueRun 1 r (head (dlToList ds))) : findRuns (n+1) (ValueRun 2 n c) cs
+    | d == c           = (UniqueRun (l-1) r (dlInit ds) d) : findRuns (n+1) (ValueRun 2 n c) cs
+    | l == 32767       = u : findRuns (n+1) (ValueRun 1 (n+1) c) cs
+    | otherwise        = findRuns (n+1) (UniqueRun (l+1) r (dlSnoc ds c) c) cs
 findRuns !n u@(ValueRun l r d) (Nothing : cs)     = u : findRuns (n+1) (NullRun 1 (n+1)) cs
 findRuns !n u@(ValueRun l r d) ((Just c) : cs)
-    | d == c    = findRuns (n+1) (ValueRun (l+1) r d) cs
-    | l == 1    = findRuns (n+1) (UniqueRun 2 n ((d:) . (c:)) c) cs
-    | otherwise = u : findRuns (n+1) (ValueRun 1 (n+1) c) cs
+    | l == 32767 = u : findRuns (n+1) (ValueRun 1 (n+1) c) cs
+    | d == c     = findRuns (n+1) (ValueRun (l+1) r d) cs
+    | l == 1     = findRuns (n+1) (UniqueRun 2 n (DList ((d:) . (c:))) c) cs
+    | otherwise  = u : findRuns (n+1) (ValueRun 1 (n+1) c) cs
 
 --------------------------------------------------------------------------------
 --old:
