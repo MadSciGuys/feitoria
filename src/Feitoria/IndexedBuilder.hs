@@ -83,6 +83,9 @@ data PosHandle = PosHandle {
   , phPos    :: !Integer
   }
 
+mkPosHandle :: MonadIO m => Handle -> m PosHandle
+mkPosHandle h = liftIO ((PosHandle h) <$> hTell h)
+
 -- | Check that a 'PosHandle' position is accurate.
 hCheckPos :: MonadIO m => PosHandle -> m Bool
 hCheckPos (PosHandle h p) = (== p) <$> (liftIO (hTell h))
