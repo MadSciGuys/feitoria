@@ -1,6 +1,5 @@
 {-# LANGUAGE OverloadedStrings
            , BangPatterns
-           , FlexibleInstances
            #-}
 
 module Feitoria.Writer where
@@ -8,17 +7,31 @@ module Feitoria.Writer where
 import           Codec.MIME.Type
 
 import           Control.Monad.Trans
+import           Control.Monad.State.Strict
+
+import           Data.Bits
+
+import qualified Data.ByteString    as B
+
+import qualified Data.Map.Strict    as M
 
 import           Data.Monoid
 
 import qualified Data.Text          as T
 import qualified Data.Text.Encoding as T
 
+import           Data.Time.Clock
+import           Data.Time.Clock.POSIX
+
+import qualified Data.Vector        as V
+
 import           Data.Word
 
 import           Feitoria.DList
 import           Feitoria.IndexedBuilder
 import           Feitoria.Types
+
+import           Foreign.Marshal.Utils
 
 import           System.IO
 
@@ -54,13 +67,13 @@ data Run = NullRun {
            , nullRunRow :: !Word64
            }
          | UniqueRun {
-             uniqueRunLen  :: !Word64
+             uniqueRunLen  :: !Word16
            , uniqueRunRow  :: !Word64
            , uniqueRunVals :: DList CellData
            , uniqueRunLast :: !CellData
            }
          | ValueRun {
-             valueRunLen :: !Word64
+             valueRunLen :: !Word16
            , valueRunRow :: !Word64
            , valueRunVal :: !CellData
            }
@@ -87,6 +100,118 @@ findRuns !n u@(ValueRun l r d) ((Just c) : cs)
     | d == c     = findRuns (n+1) (ValueRun (l+1) r d) cs
     | l == 1     = findRuns (n+1) (UniqueRun 2 n (DList ((d:) . (c:))) c) cs
     | otherwise  = u : findRuns (n+1) (ValueRun 1 (n+1) c) cs
+
+nullRun :: Word64 -> Word64 -> IndexedBuilder
+nullRun l r = word16LE 0 <> word64LE r <> word64LE l
+
+uniqueRun :: Word16 -> Word64 -> Word64 -> IndexedBuilder
+uniqueRun l r vi = word16LE ((bit 15) .|. l) <> word64LE r <> word64LE vi
+
+valueRun :: Word16 -> Word64 -> IndexedBuilder -> IndexedBuilder
+valueRun l r b = word16LE l <> word64LE r <> b
+
+data TableWriterState = TableWriterState {
+    stringLitCache :: M.Map T.Text Word64
+  , arrayLitCache  :: M.Map (V.Vector CellData) Word64
+  , binaryLitCache :: M.Map B.ByteString Word64
+  , validColLen    :: Maybe Word64
+  , colCount       :: Word64
+  , colHeaderPH    :: (FilePath, PosHandle)
+  , columnPH       :: (FilePath, PosHandle)
+  , stringLitPH    :: (FilePath, PosHandle)
+  , binaryLitPH    :: (FilePath, PosHandle)
+  , arrayLitPH     :: (FilePath, PosHandle)
+  , columnOffsets  :: DList Word64
+  }
+
+type TableWriterM = StateT TableWriterState IO
+
+stringLitCacheInsert :: T.Text -> Word64 -> TableWriterM ()
+stringLitCacheInsert t i = modify'
+    (\s -> s { stringLitCache = M.insert t i (stringLitCache s) })
+
+arrayLitCacheInsert :: (V.Vector CellData) -> Word64 -> TableWriterM ()
+arrayLitCacheInsert v i = modify'
+    (\s -> s { arrayLitCache = M.insert v i (arrayLitCache s) })
+
+binaryLitCacheInsert :: B.ByteString -> Word64 -> TableWriterM ()
+binaryLitCacheInsert b i = modify'
+    (\s -> s { binaryLitCache = M.insert b i (binaryLitCache s) })
+
+-- | Returns a builder writing either the value itself or a pointer to a
+--   literal, depending on the data type.
+writeCellData :: CellData -> TableWriterM IndexedBuilder
+writeCellData (CellDataUInt w)     = return (word64LE w)
+writeCellData (CellDataInt i)      = return (int64LE (fromIntegral i))
+writeCellData (CellDataDouble d)   = return (doubleLE d)
+writeCellData (CellDataDateTime t) = return ((word64LE .  fromIntegral . floor . utcTimeToPOSIXSeconds) t)
+writeCellData (CellDataString s)   = do
+    sc <- gets stringLitCache
+    let addString = do
+            (_, ph) <- gets stringLitPH
+            let w = fromIntegral $ phPos ph
+            hPutIndexedBuilderM ph (textUtf8 s)
+            stringLitCacheInsert s w
+            return w
+    case M.lookup s sc of (Just w) -> return (word64LE w)
+                          Nothing  -> word64LE <$> addString
+writeCellData (CellDataBinary b)   = do
+    bc <- gets binaryLitCache
+    let addBin = do
+            (_, ph) <- gets binaryLitPH
+            let w = fromIntegral $ phPos ph
+            hPutIndexedBuilderM ph (byteStringPascalString b)
+            binaryLitCacheInsert b w
+            return w
+    case M.lookup b bc of (Just w) -> return (word64LE w)
+                          Nothing  -> word64LE <$> addBin
+writeCellData (CellDataBoolean b)  = return (word64LE (fromBool b))
+
+-- | Returns the index of the array start.
+writeArrayLit :: DList CellData -> TableWriterM Word64
+writeArrayLit cs = do
+    ac <- gets arrayLitCache
+    let cl       = dlToList cs
+        cv       = V.fromList cl
+        addArray = do
+            (_, ph) <- gets arrayLitPH
+            let w  = fromIntegral $ phPos ph
+                lb = word64LE (fromIntegral (V.length cv))
+            cb <- mconcat <$> mapM writeCellData cl
+            hPutIndexedBuilderM ph (lb <> cb)
+            arrayLitCacheInsert cv w
+            return w
+    case M.lookup cv ac of (Just w) -> return w
+                           Nothing  -> addArray
+
+addColumnOffset :: TableWriterM ()
+addColumnOffset = modify
+    (\s -> s { columnOffsets = dlSnoc (columnOffsets s) (fromIntegral (phPos (snd (columnPH s)))) })
+
+validateColLen :: Word64 -> TableWriterM Bool
+validateColLen l = do
+    vl <- gets validColLen
+    case vl of Nothing  -> modify' (\s -> s { validColLen = Just l }) >> return True
+               (Just v) -> return (v == l)
+
+writeRun :: Word64 -> Run -> TableWriterM Word64
+writeRun !n (NullRun l r)        = do
+    (_, ph) <- gets columnPH
+    hPutIndexedBuilderM ph $ nullRun l r
+    return (n+1)
+writeRun !n (UniqueRun l r vs _) = do
+    (_, ph) <- gets columnPH
+    vi      <- writeArrayLit vs
+    hPutIndexedBuilderM ph $ uniqueRun l r vi
+    return (n+1)
+writeRun !n (ValueRun l r v)     = do
+    (_, ph) <- gets columnPH
+    b       <- writeCellData v
+    hPutIndexedBuilderM ph $ valueRun l r b
+    return (n+1)
+
+writeColumnRuns :: [Run] -> TableWriterM Bool
+writeColumnRuns rs = addColumnOffset >> foldM writeRun 0 rs >>= validateColLen
 
 --------------------------------------------------------------------------------
 --old:
@@ -139,21 +264,6 @@ findRuns !n u@(ValueRun l r d) ((Just c) : cs)
 --
 --import System.IO.Temp
 --
---data LazyTableState = LazyTableState {
---    stringLitCache :: M.Map T.Text Word64
---  , arrayLitCache  :: M.Map (V.Vector Cell) Word64
---  , binaryLitCache :: M.Map B.ByteString Word64
---  , currentRun     :: !LazyTableRun
---  , currentColLen  :: !Word64
---  , validColLen    :: !(Maybe Word64)
---  , colCount       :: !Word64
---  , colHeaderFP    :: (FilePath, Handle)
---  , columnFP       :: (FilePath, Handle)
---  , stringLitFP    :: (FilePath, Handle)
---  , arrayLitFP     :: (FilePath, Handle)
---  , binaryLitFP    :: (FilePath, Handle)
---  , columnOffsets  :: DiffList Int
---  }
 --
 --
 --putTable :: LazyTable -- ^ The table to write to disk.
