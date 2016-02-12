@@ -1,10 +1,13 @@
 {-# LANGUAGE OverloadedStrings
            , BangPatterns
+           , TupleSections
            #-}
 
 module Feitoria.Writer where
 
 import           Codec.MIME.Type
+
+import           Control.Exception
 
 import           Control.Monad.Trans
 import           Control.Monad.State.Strict
@@ -33,7 +36,11 @@ import           Feitoria.Types
 
 import           Foreign.Marshal.Utils
 
+import           System.Directory
+
 import           System.IO
+import           System.IO.Error
+import           System.IO.Temp
 
 -- For now we fold over each column in turn. This sucks for dealing with CSVs
 -- though, since in that case we're lazy with respect to the rows. There should
@@ -53,14 +60,14 @@ data ColumnWriter = ColumnWriter {
   , cwCells      :: [Cell]
   }
 
-renderCellType :: CellType -> IndexedBuilder
-renderCellType CellTypeUInt       = word8 0
-renderCellType CellTypeInt        = word8 1
-renderCellType CellTypeDouble     = word8 2
-renderCellType CellTypeDateTime   = word8 3
-renderCellType CellTypeString     = word8 4
-renderCellType (CellTypeBinary m) = word8 5 <> textUtf8 (showMIMEType m)
-renderCellType CellTypeBoolean    = word8 6
+cellType :: CellType -> IndexedBuilder
+cellType CellTypeUInt       = word8 0
+cellType CellTypeInt        = word8 1
+cellType CellTypeDouble     = word8 2
+cellType CellTypeDateTime   = word8 3
+cellType CellTypeString     = word8 4
+cellType (CellTypeBinary m) = word8 5 <> textUtf8 (showMIMEType m)
+cellType CellTypeBoolean    = word8 6
 
 data Run = NullRun {
              nullRunLen :: !Word64
@@ -125,6 +132,28 @@ data TableWriterState = TableWriterState {
   }
 
 type TableWriterM = StateT TableWriterState IO
+
+initTableWriterState :: FilePath -> IO (Either IOError TableWriterState)
+initTableWriterState tfp = try $ TableWriterState M.empty M.empty M.empty Nothing 0
+    <$> tf
+    <*> tf
+    <*> tf
+    <*> tf
+    <*> tf
+    <*> pure (DList id)
+    where tf = openBinaryTempFile tfp "feit" >>= (\(fp, h) -> (fp,) <$> mkPosHandle h)
+
+cleanupTableWriterState :: TableWriterState -> IO (Maybe IOError)
+cleanupTableWriterState s = eitherMaybe <$> try cleanTemp
+    where eitherMaybe (Right ()) = Nothing
+          eitherMaybe (Left e)   = Just e
+          getFP a                = fst (a s)
+          cleanTemp              = do
+            removeFile (getFP colHeaderPH)
+            removeFile (getFP columnPH)
+            removeFile (getFP stringLitPH)
+            removeFile (getFP binaryLitPH)
+            removeFile (getFP arrayLitPH)
 
 stringLitCacheInsert :: T.Text -> Word64 -> TableWriterM ()
 stringLitCacheInsert t i = modify'
@@ -212,6 +241,16 @@ writeRun !n (ValueRun l r v)     = do
 
 writeColumnRuns :: [Run] -> TableWriterM Bool
 writeColumnRuns rs = addColumnOffset >> foldM writeRun 0 rs >>= validateColLen
+
+writeTable :: -- | The table to write to disk.
+              TableWriter
+              -- | A directory in which temporary files may be created.
+           -> FilePath
+              -- | File name to which the table will be written.
+           -> FilePath
+              -- | Provide 'Nothing' on success or 'Just' an error message. Make this better later.
+           -> IO (Maybe IOError)
+writeTable = undefined
 
 --------------------------------------------------------------------------------
 --old:
