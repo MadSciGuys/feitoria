@@ -48,8 +48,8 @@ data CellData = CellDataUInt     Word64
               | CellDataInt      Int
               | CellDataDouble   Double
               | CellDataDateTime UTCTime
+              | CellDataBoolean  Bool
               | CellDataString   T.Text
               | CellDataBinary   B.ByteString
-              | CellDataBoolean  Bool
-              | CellDataArray    (V.Vector Cell)
+              | CellDataArray    (V.Vector CellData)
               deriving (Eq, Ord, Show)
