@@ -20,6 +20,7 @@ library
   exposed-modules:     Feitoria
                      , Feitoria.DList
                      , Feitoria.IndexedBuilder
+                     , Feitoria.Types
                      , Feitoria.Writer
   -- other-extensions:    
   build-depends:       base
