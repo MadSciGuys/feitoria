@@ -14,19 +14,21 @@ import           Control.Monad.State.Strict
 
 import           Data.Bits
 
-import qualified Data.ByteString    as B
+import qualified Data.ByteString         as B
+import qualified Data.ByteString.Builder as B
+import qualified Data.ByteString.Lazy    as L
 
-import qualified Data.Map.Strict    as M
+import qualified Data.Map.Strict         as M
 
 import           Data.Monoid
 
-import qualified Data.Text          as T
-import qualified Data.Text.Encoding as T
+import qualified Data.Text               as T
+import qualified Data.Text.Encoding      as T
 
 import           Data.Time.Clock
 import           Data.Time.Clock.POSIX
 
-import qualified Data.Vector        as V
+import qualified Data.Vector             as V
 
 import           Data.Word
 
@@ -57,7 +59,6 @@ data ColumnWriter = ColumnWriter {
     cwName       :: T.Text
   , cwType       :: CellType
   , cwArrayDepth :: Word64
-  , cwCells      :: [Cell]
   }
 
 cellType :: CellType -> IndexedBuilder
@@ -111,18 +112,24 @@ findRuns !n u@(ValueRun l r d) ((Just c) : cs)
 nullRun :: Word64 -> Word64 -> IndexedBuilder
 nullRun l r = word16LE 0 <> word64LE r <> word64LE l
 
-uniqueRun :: Word16 -> Word64 -> Word64 -> IndexedBuilder
-uniqueRun l r vi = word16LE ((bit 15) .|. l) <> word64LE r <> word64LE vi
+uniqueRun :: Word16 -> Word64 -> IndexedBuilder -> IndexedBuilder
+uniqueRun l r b = word16LE ((bit 15) .|. l) <> word64LE r <> b
 
 valueRun :: Word16 -> Word64 -> IndexedBuilder -> IndexedBuilder
 valueRun l r b = word16LE l <> word64LE r <> b
+
+-- The offsets are relative to the column table.
+columnHeader :: (ColumnWriter, Word64) -> IndexedBuilder
+columnHeader ((ColumnWriter n t d), o) = textUtf8 n
+                                      <> cellType t
+                                      <> word64LE d
+                                      <> word64LE o
 
 data TableWriterState = TableWriterState {
     stringLitCache :: M.Map T.Text Word64
   , arrayLitCache  :: M.Map (V.Vector CellData) Word64
   , binaryLitCache :: M.Map B.ByteString Word64
   , validColLen    :: Maybe Word64
-  , colCount       :: Word64
   , colHeaderPH    :: (FilePath, PosHandle)
   , columnPH       :: (FilePath, PosHandle)
   , stringLitPH    :: (FilePath, PosHandle)
@@ -134,7 +141,7 @@ data TableWriterState = TableWriterState {
 type TableWriterM = StateT TableWriterState IO
 
 initTableWriterState :: FilePath -> IO (Either IOError TableWriterState)
-initTableWriterState tfp = try $ TableWriterState M.empty M.empty M.empty Nothing 0
+initTableWriterState tfp = try $ TableWriterState M.empty M.empty M.empty Nothing
     <$> tf
     <*> tf
     <*> tf
@@ -143,17 +150,32 @@ initTableWriterState tfp = try $ TableWriterState M.empty M.empty M.empty Nothin
     <*> pure (DList id)
     where tf = openBinaryTempFile tfp "feit" >>= (\(fp, h) -> (fp,) <$> mkPosHandle h)
 
+rmPH :: MonadIO m => TableWriterState
+                  -> (TableWriterState -> (FilePath, PosHandle))
+                  -> m ()
+rmPH s a = liftIO $ do
+  hClose (phHandle (snd (a s)))
+  removeFile (fst (a s))
+
+eitherMaybe :: Either e () -> Maybe e
+eitherMaybe (Right ()) = Nothing
+eitherMaybe (Left e)   = Just e
+
 cleanupTableWriterState :: TableWriterState -> IO (Maybe IOError)
 cleanupTableWriterState s = eitherMaybe <$> try cleanTemp
-    where eitherMaybe (Right ()) = Nothing
-          eitherMaybe (Left e)   = Just e
-          getFP a                = fst (a s)
-          cleanTemp              = do
-            removeFile (getFP colHeaderPH)
-            removeFile (getFP columnPH)
-            removeFile (getFP stringLitPH)
-            removeFile (getFP binaryLitPH)
-            removeFile (getFP arrayLitPH)
+    where cleanTemp              = do
+            rmPH s colHeaderPH
+            rmPH s columnPH
+            rmPH s stringLitPH
+            rmPH s binaryLitPH
+            rmPH s arrayLitPH
+
+emptyCaches :: TableWriterM ()
+emptyCaches = modify'
+    (\s -> s { stringLitCache = M.empty
+             , arrayLitCache  = M.empty
+             , binaryLitCache = M.empty
+             })
 
 stringLitCacheInsert :: T.Text -> Word64 -> TableWriterM ()
 stringLitCacheInsert t i = modify'
@@ -174,12 +196,14 @@ writeCellData (CellDataUInt w)     = return (word64LE w)
 writeCellData (CellDataInt i)      = return (int64LE (fromIntegral i))
 writeCellData (CellDataDouble d)   = return (doubleLE d)
 writeCellData (CellDataDateTime t) = return ((word64LE .  fromIntegral . floor . utcTimeToPOSIXSeconds) t)
+writeCellData (CellDataBoolean b)  = return (word64LE (fromBool b))
 writeCellData (CellDataString s)   = do
     sc <- gets stringLitCache
     let addString = do
-            (_, ph) <- gets stringLitPH
+            (fp, ph) <- gets stringLitPH
             let w = fromIntegral $ phPos ph
-            hPutIndexedBuilderM ph (textUtf8 s)
+            ph' <- hPutIndexedBuilderM ph (textUtf8 s)
+            modify' (\t -> t { stringLitPH = (fp, ph') })
             stringLitCacheInsert s w
             return w
     case M.lookup s sc of (Just w) -> return (word64LE w)
@@ -187,31 +211,31 @@ writeCellData (CellDataString s)   = do
 writeCellData (CellDataBinary b)   = do
     bc <- gets binaryLitCache
     let addBin = do
-            (_, ph) <- gets binaryLitPH
+            (fp, ph) <- gets binaryLitPH
             let w = fromIntegral $ phPos ph
-            hPutIndexedBuilderM ph (byteStringPascalString b)
+            ph' <- hPutIndexedBuilderM ph (byteStringPascalString b)
+            modify' (\t -> t { binaryLitPH = (fp, ph') })
             binaryLitCacheInsert b w
             return w
     case M.lookup b bc of (Just w) -> return (word64LE w)
                           Nothing  -> word64LE <$> addBin
-writeCellData (CellDataBoolean b)  = return (word64LE (fromBool b))
+writeCellData (CellDataArray v)    = do
+    ac <- gets arrayLitCache
+    let addVec = do
+            (fp, ph) <- gets arrayLitPH
+            let w  = fromIntegral $ phPos ph
+                lb = word64LE (fromIntegral (V.length v))
+            cb  <- (V.foldl (<>) mempty) <$> V.mapM writeCellData v
+            ph' <- hPutIndexedBuilderM ph (lb <> cb)
+            modify' (\t -> t { arrayLitPH = (fp, ph') })
+            arrayLitCacheInsert v w
+            return w
+    case M.lookup v ac of (Just w) -> return (word64LE w)
+                          Nothing  -> word64LE <$> addVec
 
 -- | Returns the index of the array start.
-writeArrayLit :: DList CellData -> TableWriterM Word64
-writeArrayLit cs = do
-    ac <- gets arrayLitCache
-    let cl       = dlToList cs
-        cv       = V.fromList cl
-        addArray = do
-            (_, ph) <- gets arrayLitPH
-            let w  = fromIntegral $ phPos ph
-                lb = word64LE (fromIntegral (V.length cv))
-            cb <- mconcat <$> mapM writeCellData cl
-            hPutIndexedBuilderM ph (lb <> cb)
-            arrayLitCacheInsert cv w
-            return w
-    case M.lookup cv ac of (Just w) -> return w
-                           Nothing  -> addArray
+writeArrayLit :: DList CellData -> TableWriterM IndexedBuilder
+writeArrayLit = writeCellData . CellDataArray . V.fromList . dlToList
 
 addColumnOffset :: TableWriterM ()
 addColumnOffset = modify
@@ -225,32 +249,101 @@ validateColLen l = do
 
 writeRun :: Word64 -> Run -> TableWriterM Word64
 writeRun !n (NullRun l r)        = do
-    (_, ph) <- gets columnPH
-    hPutIndexedBuilderM ph $ nullRun l r
+    (fp, ph) <- gets columnPH
+    ph' <- hPutIndexedBuilderM ph $ nullRun l r
+    modify' (\s -> s { columnPH = (fp, ph') })
     return (n+1)
 writeRun !n (UniqueRun l r vs _) = do
-    (_, ph) <- gets columnPH
-    vi      <- writeArrayLit vs
-    hPutIndexedBuilderM ph $ uniqueRun l r vi
+    (fp, ph) <- gets columnPH
+    b   <- writeArrayLit vs
+    ph' <- hPutIndexedBuilderM ph $ uniqueRun l r b
+    modify' (\s -> s { columnPH = (fp, ph') })
     return (n+1)
 writeRun !n (ValueRun l r v)     = do
-    (_, ph) <- gets columnPH
+    (fp, ph) <- gets columnPH
     b       <- writeCellData v
-    hPutIndexedBuilderM ph $ valueRun l r b
+    ph' <- hPutIndexedBuilderM ph $ valueRun l r b
+    modify' (\s -> s { columnPH = (fp, ph') })
     return (n+1)
 
 writeColumnRuns :: [Run] -> TableWriterM Bool
 writeColumnRuns rs = addColumnOffset >> foldM writeRun 0 rs >>= validateColLen
 
+writeColumns :: [(T.Text, [Run])] -> TableWriterM (Maybe T.Text)
+writeColumns []          = return Nothing
+writeColumns ((n, rs):cs) = do
+    g <- writeColumnRuns rs
+    if g then writeColumns cs
+         else return (Just n)
+
+catColumnHeader :: [ColumnWriter] -> TableWriterM ()
+catColumnHeader cs = do
+    os <- gets (dlToList . columnOffsets)
+    (fp, ph) <- gets colHeaderPH
+    ph' <- hPutIndexedBuilderM ph (mconcat (map columnHeader (zip cs os)))
+    modify' (\s -> s { colHeaderPH = (fp, ph') })
+
+appHandle :: MonadIO m => Handle -> Handle -> m ()
+appHandle t a = liftIO $ L.hGetContents a >>= L.hPut t
+
+catTable :: TableWriter -> Handle -> TableWriterM ()
+catTable (TableWriter v t cs) h = do
+    s <- get
+    colHeaderH <- gets (phHandle . snd . colHeaderPH)
+    columnH    <- gets (phHandle . snd . columnPH)
+    stringLitH <- gets (phHandle . snd . stringLitPH)
+    binaryLitH <- gets (phHandle . snd . binaryLitPH)
+    arrayLitH  <- gets (phHandle . snd . arrayLitPH)
+    colHeaderSize <- gets (phPos . snd . colHeaderPH)
+    columnSize    <- gets (phPos . snd . columnPH)
+    stringLitSize <- gets (phPos . snd . stringLitPH)
+    binaryLitSize <- gets (phPos . snd . binaryLitPH)
+    let (IndexedBuilder b i) = byteString "w\01\01\01"
+                            <> word64LE v
+                            <> textUtf8 t
+                            <> word64LE (fromIntegral (length cs))
+        tableHeaderSize      = i + (8 * 4) -- Header so far, plus four more pointers.
+        colTableOffset       = tableHeaderSize + colHeaderSize
+        stringTableOffset    = colTableOffset + columnSize
+        binaryTableOffset    = stringTableOffset + stringLitSize
+        arrayTableOffset     = binaryTableOffset + binaryLitSize
+    liftIO $ B.hPutBuilder h (b <> B.word64LE (fromIntegral colTableOffset)
+                                <> B.word64LE (fromIntegral stringTableOffset)
+                                <> B.word64LE (fromIntegral binaryTableOffset)
+                                <> B.word64LE (fromIntegral arrayTableOffset))
+    appHandle h colHeaderH
+    rmPH s colHeaderPH
+    appHandle h columnH
+    rmPH s columnPH
+    appHandle h stringLitH
+    rmPH s stringLitPH
+    appHandle h binaryLitH
+    rmPH s binaryLitPH
+    appHandle h arrayLitH
+    rmPH s arrayLitPH
+
 writeTable :: -- | The table to write to disk.
               TableWriter
+              -- | A strict list of lazy lists of column cells.
+           -> [[Cell]]
               -- | A directory in which temporary files may be created.
            -> FilePath
               -- | File name to which the table will be written.
            -> FilePath
               -- | Provide 'Nothing' on success or 'Just' an error message. Make this better later.
            -> IO (Maybe IOError)
-writeTable = undefined
+writeTable table cells tmpdir outfile
+    | (length (twColumns table)) /= (length cells) = return
+        (Just (userError "TableWriter and cell list have different column numbers."))
+    | otherwise = do
+        h  <- openFile outfile WriteMode
+        is <- initTableWriterState tmpdir
+        case is of (Left e)  -> return $ Just e
+                   (Right s) -> eitherMaybe <$> try (evalStateT (writeTable' h) s)
+        where writeTable' h = do
+                bc <- writeColumns $ zip (map cwName (twColumns table)) (map cellRuns cells)
+                case bc of (Just e) -> emptyCaches >> throw (userError ((T.unpack e) ++ " has the wrong number of rows."))
+                           Nothing  -> emptyCaches >> catColumnHeader (twColumns table) >> catTable table h
 
 --------------------------------------------------------------------------------
 --old:
