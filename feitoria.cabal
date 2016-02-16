@@ -21,7 +21,8 @@ library
                      , Feitoria.DList
                      , Feitoria.IndexedBuilder
                      , Feitoria.Types
-                     , Feitoria.Writer
+                     , Feitoria.Writer.ColumnWise
+                     , Feitoria.Writer.RowWise
   -- other-extensions:    
   build-depends:       base
                      , bytestring

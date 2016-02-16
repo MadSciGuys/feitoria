@@ -1,7 +1,7 @@
 module Feitoria
     ( module Feitoria.Types
-    , module Feitoria.Writer
+    , module Feitoria.Writer.ColumnWise
     ) where
 
 import Feitoria.Types
-import Feitoria.Writer
+import Feitoria.Writer.ColumnWise
